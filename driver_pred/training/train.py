@@ -1,75 +1,158 @@
+import os
 import numpy as np
 import pandas as pd
-from sklearn import metrics
-from sklearn.model_selection import train_test_split
 import lightgbm
+from sklearn.model_selection import StratifiedKFold
+from azureml.core import Run
+import joblib
+import argparse
+import statistics
 
-def split_data(data_df):
-    """Split a dataframe into training and validation datasets"""
-    features = data_df.drop(['target', 'id'], axis=1)
-    labels = np.array(data_df['target'])
-    (features_train,
-     features_valid,
-     labels_train,
-     labels_valid) = train_test_split(
-         features,
-         labels,
-         test_size=0.2,
-         random_state=0)
+# Get the experiment run context
+run = Run.get_context()
 
-    train_data = lightgbm.Dataset(
-        features_train,
-        label=labels_train)
-    valid_data = lightgbm.Dataset(
-        features_valid,
-        label=labels_valid,
-        free_raw_data=False)
-    return (train_data, valid_data)
+# Get parameters
+parser = argparse.ArgumentParser()
+parser.add_argument('--output_folder', type=str, dest='output_folder')
+args = parser.parse_args()
+output_folder = args.output_folder
 
-def train_model(data, parameters):
-    """Train a model with the given datasets and parameters"""
-    # The data returned in split_data is an array.
-    # Access train_data with data[0] and valid_data with data[1]
+# train_df = pd.read_csv('porto_seguro_safe_driver_prediction_input.csv')
+
+from azureml.core import Workspace, Dataset
+
+subscription_id = '29b64be4-867b-40ee-a259-b58b97bfc26f'
+resource_group = 'mlops-AML-WS'
+workspace_name = 'mlops-AML-WS'
+
+workspace = Workspace(subscription_id, resource_group, workspace_name)
+
+df = Dataset.get_by_name(workspace, name='driver-prediction')
+df.to_pandas_dataframe()
+
+print(train_df.shape)
+train_df.head()
+
+y = np.array(train_df['target'])
+X = train_df.drop('target', axis=1)
+
+skf = StratifiedKFold(n_splits=10)
+skf.get_n_splits(X, y)
+
+
+def gini(actual, pred, cmpcol=0, sortcol=1):
+    assert(len(actual) == len(pred))
+    all = np.asarray(
+        np.c_[actual, pred, np.arange(len(actual))],
+        dtype=np.float
+    )
+    all = all[np.lexsort((all[:, 2], -1*all[:, 1]))]
+    totalLosses = all[:, 0].sum()
+    giniSum = all[:, 0].cumsum().sum() / totalLosses
+
+    giniSum -= (len(actual) + 1) / 2
+    return giniSum / len(actual)
+
+
+def gini_normalized(a, p):
+    return gini(a, p) / gini(a, a)
+
+
+def get_metadata(train):
+    data = []
+    for f in train.columns:
+        # Defining the role
+        if f == 'target':
+            role = 'target'
+        elif f == 'id':
+            role = 'id'
+        else:
+            role = 'input'
+
+        # Defining the level
+        if 'bin' in f or f == 'target':
+            level = 'binary'
+        elif 'cat' in f or f == 'id':
+            level = 'nominal'
+        elif train[f].dtype == float:
+            level = 'interval'
+        elif train[f].dtype == int:
+            level = 'ordinal'
+
+        # Initialize keep to True for all variables except for id
+        keep = True
+        if f == 'id':
+            keep = False
+
+        # Defining the data type
+        dtype = train[f].dtype
+
+        # Creating a Dict that contains all the metadata for the variable
+        f_dict = {
+            'varname': f,
+            'role': role,
+            'level': level,
+            'keep': keep,
+            'dtype': dtype
+        }
+        data.append(f_dict)
+
+    meta = pd.DataFrame(
+        data,
+        columns=['varname', 'role', 'level', 'keep', 'dtype']
+    )
+    meta.set_index('varname', inplace=True)
+    return meta
+
+
+parameters = {
+    'learning_rate': 0.02,
+    'boosting_type': 'gbdt',
+    'objective': 'binary',
+    'metric': 'auc',
+    'sub_feature': 0.7,
+    'num_leaves': 60,
+    'min_data': 100,
+    'min_hessian': 1,
+    'verbose': 4
+}
+
+for param in parameters:
+    run.log(param, parameters[param])
+
+meta = get_metadata(X)
+v = meta[(meta.level == 'nominal') & (meta.keep)].index
+X = pd.get_dummies(X, columns=v, drop_first=True)
+
+gini_norms = []
+for train_index, test_index in skf.split(X, y):
+    # print("TRAIN:", train_index, "TEST:", test_index)
+    X_train, X_test = X.ix[train_index], X.ix[test_index]
+    y_train, y_test = y[train_index], y[test_index]
+
+    train_data = lightgbm.Dataset(X_train, label=y_train)
+    valid_data = lightgbm.Dataset(X_test, label=y_test)
+
     model = lightgbm.train(parameters,
-                           data[0],
-                           valid_sets=data[1],
+                           train_data,
+                           valid_sets=valid_data,
                            num_boost_round=500,
                            early_stopping_rounds=20)
-    return model
 
-def get_model_metrics(model, data):
-    """Construct a dictionary of metrics for the model"""
-    predictions = model.predict(data[1].data)
-    fpr, tpr, thresholds = metrics.roc_curve(data[1].label, predictions)
-    model_metrics = {"auc": (metrics.auc(fpr, tpr))}
-    return model_metrics
+    predictions = model.predict(X_test)
+    gini_norms.append(gini_normalized(y_test, predictions))
 
-def main():
-    """This method invokes the training functions for development purposes"""
+# Save the trained model
+os.makedirs(output_folder, exist_ok=True)
+output_path = output_folder + "/model.pkl"
+joblib.dump(value=model, filename=output_path)
 
-    # Read data from a file
-    data_df = pd.read_csv('porto_seguro_safe_driver_prediction_input.csv')
+print(gini_norms)
+print(statistics.mean(gini_norms))
+print(statistics.stdev(gini_norms))
 
-    # Hard code the parameters for training the model
-    parameters = {
-        'learning_rate': 0.02,
-        'boosting_type': 'gbdt',
-        'objective': 'binary',
-        'metric': 'auc',
-        'sub_feature': 0.7,
-        'num_leaves': 60,
-        'min_data': 100,
-        'min_hessian': 1,
-        'verbose': 0
-    }
+run.log_list("gini_norms", gini_norms)
+run.log("mean", statistics.mean(gini_norms))
+run.log("stdev", statistics.stdev(gini_norms))
 
-    # Invoke the functions defined in this file
-    data = split_data(data_df)
-    model = train_model(data, parameters)
-    metrics = get_model_metrics(model, data)
-
-    # Print the resulting metrics for the model
-    print(metrics)
-
-if __name__ == '__main__':
-    main()
+run.complete()
