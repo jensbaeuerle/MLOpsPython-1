@@ -17,19 +17,7 @@ parser.add_argument('--output_folder', type=str, dest='output_folder')
 args = parser.parse_args()
 output_folder = args.output_folder
 
-# train_df = pd.read_csv('porto_seguro_safe_driver_prediction_input.csv')
-
-from azureml.core import Workspace, Dataset
-
-subscription_id = '29b64be4-867b-40ee-a259-b58b97bfc26f'
-resource_group = 'mlops-AML-WS'
-workspace_name = 'mlops-AML-WS'
-
-workspace = Workspace(subscription_id, resource_group, workspace_name)
-
-df = Dataset.get_by_name(workspace, name='driver-prediction')
-df.to_pandas_dataframe()
-
+train_df = pd.read_csv('porto_seguro_safe_driver_prediction_input.csv')
 print(train_df.shape)
 train_df.head()
 
